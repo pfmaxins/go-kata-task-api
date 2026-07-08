@@ -2,8 +2,10 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"log"
 	"net/http"
+	"strconv"
 
 	"github.com/emersion/go-bcrypt"
 	"github.com/gin-gonic/gin"
@@ -15,17 +17,32 @@ import (
 const SUPER_SECRET_KEY = "jrq52348970b822hjkvcxcu972"
 
 // Structs for request validation
-type rLogin struct {
+type LoginRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
 }
-type rRegister struct {
+type RegisterRequest struct {
 	Name string `json:"name"`
-	rLogin
+	LoginRequest
 }
-type rTodos struct {
+type TodosRequest struct {
 	Title       string `json:"title"`
 	Description string `json:"description"`
+}
+type TodosResponse struct {
+}
+
+func valJWT(token *jwt.Token) (any, error) {
+	// Verify the signing method is HMAC
+	if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+		return nil, errors.New("Invalid singing method")
+	}
+	return []byte(SUPER_SECRET_KEY), nil
+}
+
+func createJWT(id string) (string, error) {
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS512, jwt.RegisteredClaims{ID: id}).SignedString(SUPER_SECRET_KEY)
+	return token, err
 }
 
 func main() {
@@ -61,10 +78,10 @@ func main() {
 
 	// Create register endpiont, check body, check email in use, encrypt password return token
 	r.POST("/register", func(ctx *gin.Context) {
-		var body rRegister
+		var body RegisterRequest
 		err := ctx.ShouldBindJSON(&body)
 		if err != nil {
-			ctx.JSON(http.StatusInternalServerError, err.Error())
+			ctx.JSON(http.StatusBadRequest, err.Error())
 			return
 		}
 		exists := db.QueryRow("SELECT * FROM users WHERE email = ?", body.Email)
@@ -83,7 +100,7 @@ func main() {
 			ctx.JSON(http.StatusInternalServerError, err.Error())
 			return
 		}
-		token, err := jwt.NewWithClaims(jwt.SigningMethodHS512, jwt.RegisteredClaims{ID: id}).SignedString(SUPER_SECRET_KEY)
+		token, err := createJWT(id)
 		if err != nil {
 			ctx.JSON(http.StatusInternalServerError, err.Error())
 			return
@@ -93,10 +110,10 @@ func main() {
 
 	// Create a login endpoint, hash body password and return token
 	r.POST("/login", func(ctx *gin.Context) {
-		var body rLogin
+		var body LoginRequest
 		err := ctx.ShouldBindJSON(&body)
 		if err != nil {
-			ctx.JSON(http.StatusInternalServerError, err.Error())
+			ctx.JSON(http.StatusBadRequest, err.Error())
 			return
 		}
 		var hashedPassword string
@@ -111,7 +128,7 @@ func main() {
 			ctx.JSON(http.StatusInternalServerError, err.Error())
 			return
 		}
-		token, err := jwt.NewWithClaims(jwt.SigningMethodHS512, jwt.RegisteredClaims{ID: id}).SignedString(SUPER_SECRET_KEY)
+		token, err := createJWT(id)
 		if err != nil {
 			ctx.JSON(http.StatusInternalServerError, err.Error())
 			return
@@ -121,15 +138,102 @@ func main() {
 
 	// Create a task, validate token, get claims, insert to table
 	r.POST("/todos", func(ctx *gin.Context) {
-		var body rTodos
+		var body TodosRequest
 		err := ctx.ShouldBindJSON(&body)
+		if err != nil {
+			ctx.JSON(http.StatusBadRequest, err.Error())
+			return
+		}
+		token := ctx.GetHeader("token")
+		claims := &jwt.RegisteredClaims{}
+		parsedToken, err := jwt.ParseWithClaims(token, claims, valJWT)
+		if err != nil {
+			ctx.JSON(http.StatusUnauthorized, err.Error())
+			return
+		}
+		claims, ok := parsedToken.Claims.(*jwt.RegisteredClaims)
+		if !ok {
+			ctx.JSON(http.StatusInternalServerError, gin.H{"error": "error parsing token"})
+			return
+		}
+		userID := claims.ID
+		var taskID string
+		err = db.QueryRow("INSERT INTO tasks (user_id, title, description) VALUES (?,?,?) RETURNING id", userID, body.Title, body.Description).Scan(&taskID)
 		if err != nil {
 			ctx.JSON(http.StatusInternalServerError, err.Error())
 			return
 		}
-		// TODO: learn how to parse token for claims (id), and query the DB
-		// token := ctx.GetHeader("token")
-		// claims := &jwt.RegisteredClaims{}
-		// jwt.ParseWithClaims(token, claims)
+		ctx.JSON(http.StatusOK, gin.H{
+			"id":          taskID,
+			"title":       body.Title,
+			"description": body.Description,
+		})
+	})
+
+	r.PUT("/todos/:id", func(ctx *gin.Context) {
+		var body TodosRequest
+		err := ctx.ShouldBindJSON(&body)
+		if err != nil {
+			ctx.JSON(http.StatusBadRequest, err.Error())
+			return
+		}
+		token := ctx.GetHeader("token")
+		claims := jwt.RegisteredClaims{}
+		_, err = jwt.ParseWithClaims(token, &claims, valJWT)
+		if err != nil {
+			ctx.JSON(http.StatusUnauthorized, err.Error())
+			return
+		}
+		if claims.ID != ctx.Param("id") {
+			ctx.JSON(http.StatusForbidden, gin.H{"message": "Forbidden"})
+			return
+		}
+		var taskID int
+		err = db.QueryRow("UPDATE tasks SET title = ?, description = ? WHERE id = ? RETURNING id", body.Title, body.Description, ctx.Param("id")).Scan(&taskID)
+		if err != nil {
+			ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		ctx.JSON(http.StatusOK, gin.H{
+			"id":          taskID,
+			"title":       body.Title,
+			"description": body.Description,
+		})
+	})
+
+	r.DELETE("/todos/:id", func(ctx *gin.Context) {
+		token := ctx.GetHeader("token")
+		claims := jwt.RegisteredClaims{}
+		_, err = jwt.ParseWithClaims(token, &claims, valJWT)
+		if err != nil {
+			ctx.JSON(http.StatusUnauthorized, err.Error())
+			return
+		}
+		if claims.ID != ctx.Param("id") {
+			ctx.JSON(http.StatusForbidden, gin.H{"message": "Forbidden"})
+			return
+		}
+		_, err := db.Exec("DELETE FROM tasks WHERE id = ?", ctx.Param("id"))
+		if err != nil {
+			ctx.JSON(http.StatusInternalServerError, err.Error())
+			return
+		}
+		ctx.JSON(http.StatusNoContent, gin.H{})
+	})
+
+	r.GET("/todos", func(ctx *gin.Context) {
+		page := ctx.Query("page")
+		limit := ctx.Query("limit")
+		pageInt, err := strconv.Atoi(page)
+		if err != nil {
+			ctx.JSON(http.StatusInternalServerError, err.Error())
+			return
+		}
+		limitInt, err := strconv.Atoi(limit)
+		if err != nil {
+			ctx.JSON(http.StatusInternalServerError, err.Error())
+			return
+		}
+		log.Println(pageInt, limitInt)
 	})
 }

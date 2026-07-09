@@ -14,7 +14,7 @@ import (
 )
 
 // Hardcoded (wrong) signing key
-const SUPER_SECRET_KEY = "jrq52348970b822hjkvcxcu972"
+var SUPER_SECRET_KEY = "jrq52348970b822hjkvcxcu972"
 
 // Structs for request validation
 type LoginRequest struct {
@@ -41,7 +41,7 @@ func valJWT(token *jwt.Token) (any, error) {
 }
 
 func createJWT(id string) (string, error) {
-	token, err := jwt.NewWithClaims(jwt.SigningMethodHS512, jwt.RegisteredClaims{ID: id}).SignedString(SUPER_SECRET_KEY)
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS512, jwt.RegisteredClaims{ID: id}).SignedString([]byte(SUPER_SECRET_KEY))
 	return token, err
 }
 
@@ -84,9 +84,14 @@ func main() {
 			ctx.JSON(http.StatusBadRequest, err.Error())
 			return
 		}
-		exists := db.QueryRow("SELECT * FROM users WHERE email = ?", body.Email)
-		if exists != nil {
+		var exists bool
+		err = db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE email = ?)", body.Email).Scan(&exists)
+		if err != nil {
 			ctx.JSON(http.StatusInternalServerError, gin.H{"error": "email already in use"})
+			return
+		}
+		if exists {
+			ctx.JSON(http.StatusConflict, gin.H{"error": "email already in use"})
 			return
 		}
 		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(body.Password), 10)
@@ -234,6 +239,10 @@ func main() {
 			ctx.JSON(http.StatusInternalServerError, err.Error())
 			return
 		}
-		log.Println(pageInt, limitInt)
+		maximum := pageInt * limitInt
+		// TODO: Implement todos, understand paging and limit
+		log.Println(maximum)
 	})
+
+	r.Run()
 }

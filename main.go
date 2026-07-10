@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 
 	"github.com/emersion/go-bcrypt"
@@ -13,8 +14,8 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// Hardcoded (wrong) signing key
-var SUPER_SECRET_KEY = "jrq52348970b822hjkvcxcu972"
+// Get secret key from .env file
+var SECRET_KEY = os.Getenv("SECRET_KEY")
 
 // Structs for request validation
 type LoginRequest struct {
@@ -29,7 +30,10 @@ type TodosRequest struct {
 	Title       string `json:"title"`
 	Description string `json:"description"`
 }
-type TodosResponse struct {
+type TodoItemResponse struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
 }
 
 func valJWT(token *jwt.Token) (any, error) {
@@ -37,11 +41,11 @@ func valJWT(token *jwt.Token) (any, error) {
 	if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 		return nil, errors.New("Invalid singing method")
 	}
-	return []byte(SUPER_SECRET_KEY), nil
+	return []byte(SECRET_KEY), nil
 }
 
 func createJWT(id string) (string, error) {
-	token, err := jwt.NewWithClaims(jwt.SigningMethodHS512, jwt.RegisteredClaims{ID: id}).SignedString([]byte(SUPER_SECRET_KEY))
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS512, jwt.RegisteredClaims{ID: id}).SignedString([]byte(SECRET_KEY))
 	return token, err
 }
 
@@ -54,20 +58,20 @@ func main() {
 	_, err = db.Exec(`
 	PRAGMA foreign_keys = ON;
 	CREATE TABLE IF NOT EXISTS users (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			name VARCHAR(254),
-			email VARCHAR(254) UNIQUE,
-			password BLOB
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name VARCHAR(254),
+		email VARCHAR(254) UNIQUE,
+		password BLOB
 	);
 	CREATE TABLE IF NOT EXISTS tasks (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			user_id INTEGER NOT NULL,
-			title VARCHAR(254),
-			description VARCHAR(254),
-			CONSTRAINT fk_tasks_user
-					FOREIGN KEY (user_id)
-					REFERENCES users(id)
-					ON DELETE CASCADE
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id INTEGER NOT NULL,
+		title VARCHAR(254),
+		description VARCHAR(254),
+		CONSTRAINT fk_tasks_user
+			FOREIGN KEY (user_id)
+			REFERENCES users(id)
+			ON DELETE CASCADE
 	);
 	`)
 	if err != nil {
@@ -128,6 +132,10 @@ func main() {
 			return
 		}
 		err = bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(body.Password))
+		if err != bcrypt.ErrMismatchedHashAndPassword {
+			ctx.JSON(http.StatusUnauthorized, err.Error())
+			return
+		}
 		if err != nil {
 			ctx.JSON(http.StatusInternalServerError, err.Error())
 			return
@@ -148,7 +156,11 @@ func main() {
 			ctx.JSON(http.StatusBadRequest, err.Error())
 			return
 		}
-		token := ctx.GetHeader("token")
+		token := ctx.GetHeader("Authorization")
+		if token == "" {
+			ctx.JSON(http.StatusUnauthorized, gin.H{"message": "Unauthorized"})
+			return
+		}
 		claims := jwt.RegisteredClaims{}
 		_, err = jwt.ParseWithClaims(token, &claims, valJWT)
 		if err != nil {
@@ -162,10 +174,10 @@ func main() {
 			ctx.JSON(http.StatusInternalServerError, err.Error())
 			return
 		}
-		ctx.JSON(http.StatusOK, gin.H{
-			"id":          taskID,
-			"title":       body.Title,
-			"description": body.Description,
+		ctx.JSON(http.StatusOK, TodoItemResponse{
+			ID:          taskID,
+			Title:       body.Title,
+			Description: body.Description,
 		})
 	})
 
@@ -177,7 +189,11 @@ func main() {
 			ctx.JSON(http.StatusBadRequest, err.Error())
 			return
 		}
-		token := ctx.GetHeader("token")
+		token := ctx.GetHeader("Authorization")
+		if token == "" {
+			ctx.JSON(http.StatusUnauthorized, gin.H{"message": "Unauthorized"})
+			return
+		}
 		claims := jwt.RegisteredClaims{}
 		_, err = jwt.ParseWithClaims(token, &claims, valJWT)
 		if err != nil {
@@ -193,27 +209,42 @@ func main() {
 			ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		ctx.JSON(http.StatusOK, gin.H{
-			"id":          ctx.Param("id"),
-			"title":       body.Title,
-			"description": body.Description,
+		ctx.JSON(http.StatusOK, TodoItemResponse{
+			ID:          ctx.Param("id"),
+			Title:       body.Title,
+			Description: body.Description,
 		})
 	})
 
 	// Validate token, get user_id from tasks id and compare
 	r.DELETE("/todos/:id", func(ctx *gin.Context) {
-		token := ctx.GetHeader("token")
+		token := ctx.GetHeader("Authorization")
+		if token == "" {
+			ctx.JSON(http.StatusUnauthorized, gin.H{"message": "Unauthorized"})
+			return
+		}
 		claims := jwt.RegisteredClaims{}
 		_, err = jwt.ParseWithClaims(token, &claims, valJWT)
 		if err != nil {
 			ctx.JSON(http.StatusUnauthorized, err.Error())
 			return
 		}
-		if claims.ID != ctx.Param("id") {
+		// TODO: Get the user id from the task, compare it to param
+		var taskID string
+		err := db.QueryRow("SELECT id FROM tasks WHERE user_id = ?", claims.ID).Scan(&taskID)
+		if err == sql.ErrNoRows {
 			ctx.JSON(http.StatusForbidden, gin.H{"message": "Forbidden"})
 			return
 		}
-		_, err := db.Exec("DELETE FROM tasks WHERE id = ?", ctx.Param("id"))
+		if err != nil {
+			ctx.JSON(http.StatusInternalServerError, err.Error())
+			return
+		}
+		if taskID != ctx.Param("id") {
+			ctx.JSON(http.StatusForbidden, gin.H{"message": "Forbidden"})
+			return
+		}
+		_, err = db.Exec("DELETE FROM tasks WHERE id = ?", ctx.Param("id"))
 		if err != nil {
 			ctx.JSON(http.StatusInternalServerError, err.Error())
 			return
@@ -221,22 +252,57 @@ func main() {
 		ctx.Status(http.StatusNoContent)
 	})
 
+	// Parse token, get and convert params, query total, and query tasks
 	r.GET("/todos", func(ctx *gin.Context) {
-		page := ctx.Query("page")
-		limit := ctx.Query("limit")
-		pageInt, err := strconv.Atoi(page)
+		token := ctx.GetHeader("Authorization")
+		if token == "" {
+			ctx.JSON(http.StatusUnauthorized, gin.H{"message": "Unauthorized"})
+			return
+		}
+		claims := jwt.RegisteredClaims{}
+		_, err := jwt.ParseWithClaims(token, &claims, valJWT)
+		if err != nil {
+			ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		pageInt, err := strconv.Atoi(ctx.Query("page"))
 		if err != nil {
 			ctx.JSON(http.StatusInternalServerError, err.Error())
 			return
 		}
-		limitInt, err := strconv.Atoi(limit)
+		limitInt, err := strconv.Atoi(ctx.Query("limit"))
 		if err != nil {
 			ctx.JSON(http.StatusInternalServerError, err.Error())
 			return
 		}
-		maximum := pageInt * limitInt
-		// TODO: Implement todos, understand paging and limit
-		log.Println(maximum)
+		var total int
+		err = db.QueryRow("SELECT COUNT(*) FROM tasks WHERE user_id = ?", claims.ID).Scan(&total)
+		if err != nil {
+			ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		offset := (pageInt - 1) * limitInt
+		row, err := db.Query("SELECT id, title, description FROM tasks WHERE user_id = ? ORDER BY id LIMIT ?,?", claims.ID, offset, limitInt)
+		var data []TodoItemResponse
+		var id, title, description string
+		for row.Next() {
+			err := row.Scan(&id, &title, &description)
+			if err != nil {
+				ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			data = append(data, TodoItemResponse{
+				ID:          id,
+				Title:       title,
+				Description: description,
+			})
+		}
+		ctx.JSON(http.StatusOK, gin.H{
+			"data":  data,
+			"page":  pageInt,
+			"limit": limitInt,
+			"total": total,
+		})
 	})
 
 	r.Run()

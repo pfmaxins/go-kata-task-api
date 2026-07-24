@@ -229,7 +229,6 @@ func main() {
 			ctx.JSON(http.StatusUnauthorized, err.Error())
 			return
 		}
-		// TODO: Get the user id from the task, compare it to param
 		var taskID string
 		err := db.QueryRow("SELECT id FROM tasks WHERE user_id = ?", claims.ID).Scan(&taskID)
 		if err == sql.ErrNoRows {
